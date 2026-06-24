@@ -1,0 +1,69 @@
+==============================================================================
+ SCENARIO: parts_shortage    (data/scenarios/scenario_parts_shortage.json)
+==============================================================================
+ STATUS  : EXPECTED TRACE (derived by static analysis of the .asl/.java sources)
+           NOT a captured run. Regenerate the real console output with:
+
+               gradle run  >  tests/results/scenario_parts_shortage_results.txt  2>&1
+
+           then replace everything below this header.
+
+ IMPORTANT — to make this scenario actually fire a parts shortage, the
+ ServiceCenter must start with the requested part out of stock. The scenario
+ JSON (data/scenarios/scenario_parts_shortage.json -> "brake_pad:0") is NOT
+ yet read by the environment, so set it in the agent before running:
+
+     // service_center_agent.asl
+     parts_inventory(brake_pad, 0).      // was 10
+     parts_inventory(oil_filter, 10).
+
+ (Or wire FleetMASEnvironment.init(args) to load the scenario file and inject
+ the initial parts_inventory percepts — see README §7.)
+
+ CONFIG  : USE_REAL_INTEGRATIONS = false; brake_pad = 0, oil_filter = 10
+ EXPECT  : brake-wear requests are DECLINED with parts_shortage(brake_pad);
+           the vehicle resets and may retry; oil_filter requests still succeed.
+------------------------------------------------------------------------------
+
+[FleetCoordinator] Booting up — stigmergy coordination active.
+[FleetCoordinator] Registered with MaintenanceDataBridge.
+[FleetCoordinator] Broadcasting booking_pressure: low
+[ServiceCenterAgent] Operational. Ready for maintenance requests.
+[ServiceCenterAgent] Advertising free capacity: 3
+[FleetCoordinator] Vehicle registered: vehicle_agent1 — fleet size now 1
+[FleetCoordinator] Vehicle registered: vehicle_agent2 — fleet size now 2
+[FleetCoordinator] Vehicle registered: vehicle_agent3 — fleet size now 3
+
+--- Collective brake_wear alert: vehicles switch requested part to brake_pad ---
+[FleetCoordinator] Anomaly from vehicle_agent1 type=brake_wear severity=high
+[FleetCoordinator] Anomaly from vehicle_agent2 type=brake_wear severity=medium
+[FleetCoordinator] COLLECTIVE ALERT — anomaly pattern detected: brake_wear across 2 vehicles.
+[FleetCoordinator] Broadcast sent: fleet_anomaly_alert(brake_wear,2).
+[VehicleAgent] Fleet brake_wear pattern across 2 units. Prioritising brake service.
+
+--- Request for brake_pad is DECLINED (out of stock) ---
+[VehicleAgent:vehicle_agent1] Sending book_request to FleetCoordinator (part=brake_pad).
+[FleetCoordinator] book_request from vehicle_agent1 part=brake_pad urgency=high — forwarding to ServiceCenter.
+[ServiceCenterAgent] Received request from vehicle_agent1 (part=brake_pad, urgency=high)
+[ServiceCenterAgent] DECLINED: out of stock for brake_pad
+[VehicleAgent] Booking declined: parts_shortage(brake_pad). Will retry on next cycle.
+
+[ServiceCenterAgent] Received request from vehicle_agent2 (part=brake_pad, urgency=high)
+[ServiceCenterAgent] DECLINED: out of stock for brake_pad
+[VehicleAgent] Booking declined: parts_shortage(brake_pad). Will retry on next cycle.
+
+--- No service record is created for declined requests; no endorsement occurs ---
+--- (If a vehicle's requested part reverts to oil_filter, that booking succeeds) ---
+[ServiceCenterAgent] Received request from vehicle_agent3 (part=oil_filter, urgency=high)
+[ServiceCenterAgent] Resources found. Allocating slot1 to vehicle_agent3 (tech=tech_b)
+[ServiceCenterAgent] Logged record #1 — vehicle=vehicle_agent3 part=oil_filter tech=tech_b cost=85
+[FleetCoordinator] Cross-org endorsement of record #1 for vehicle_agent3 — APPROVE.
+[ServiceCenterAgent] Record #1 ENDORSED (approve) — committed to ledger.
+[VehicleAgent] Booking CONFIRMED at service_center_agent slot slot1.
+
+==============================================================================
+ RESULT (expected): brake_pad requests DECLINED with reason
+ parts_shortage(brake_pad); no record logged for declines; in-stock
+ (oil_filter) requests still confirm and are endorsed. Demonstrates that the
+ capacity model distinguishes a materials constraint from a labour constraint.
+==============================================================================

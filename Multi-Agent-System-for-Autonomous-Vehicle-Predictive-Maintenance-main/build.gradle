@@ -1,0 +1,50 @@
+plugins {
+    id 'java'
+}
+
+group   = 'ise.mas'
+version = '1.0.0'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'io.github.jason-lang:jason-interpreter:3.3.0'
+    implementation 'org.glassfish:javax.json:1.1.4'
+    implementation 'javax.json:javax.json-api:1.1.4'
+}
+
+sourceSets {
+    main {
+        java {
+            srcDirs = ['.']
+        }
+    }
+}
+
+compileJava {
+    sourceCompatibility = '21'
+    targetCompatibility = '21'
+    options.encoding = 'UTF-8'
+}
+
+task run(type: JavaExec, dependsOn: compileJava) {
+    group       = 'application'
+    description = 'Launch Jason MAS'
+    classpath   = sourceSets.main.runtimeClasspath
+    mainClass   = 'jason.infra.local.RunLocalMAS'
+    args        = ['mas/maintenance.mas2j']
+    workingDir  = projectDir
+    jvmArgs     = [
+        '-Djava.awt.headless=true',
+        "-Djava.util.logging.config.file=${projectDir}/logging.properties"
+    ]
+    standardOutput = System.out
+    errorOutput    = System.err
+}
+
+jar {
+    archiveFileName = 'fleet-mas-env.jar'
+    from sourceSets.main.output
+}

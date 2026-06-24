@@ -1,0 +1,12 @@
+MAS maintenance {
+
+    environment: env.FleetMASEnvironment
+
+    agents:
+        fleet_coordinator_agent #1;
+        vehicle_agent #3;
+        service_center_agent #1;
+
+    aslSourcePath: "mas/agents";
+
+}

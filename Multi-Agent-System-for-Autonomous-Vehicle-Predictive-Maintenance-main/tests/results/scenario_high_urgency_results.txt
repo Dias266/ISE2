@@ -1,0 +1,76 @@
+==============================================================================
+ SCENARIO: high_urgency      (data/scenarios/scenario_high_urgency.json)
+==============================================================================
+ STATUS  : EXPECTED TRACE (derived by static analysis of the .asl/.java sources)
+           NOT a captured run. Regenerate the real console output with:
+
+               gradle run  >  tests/results/scenario_high_urgency_results.txt  2>&1
+
+           then replace everything below this header.
+ CONFIG  : env.FleetMASEnvironment USE_REAL_INTEGRATIONS = false (mock adapters)
+           ServiceCenter: capacity=3, slots=3, brake_pad=10, oil_filter=10
+ EXPECT  : many simultaneous requests escalate booking_pressure to CRITICAL;
+           stigmergy backpressure makes some vehicles DEFER their own request
+           (emergent load shedding); confirmed bookings then decay pressure.
+------------------------------------------------------------------------------
+
+[FleetCoordinator] Booting up — stigmergy coordination active.
+[FleetCoordinator] Registered with MaintenanceDataBridge.
+[FleetCoordinator] Broadcasting booking_pressure: low
+[FleetCoordinator] Monitoring IoT stream for fleet-wide anomaly patterns.
+[ServiceCenterAgent] Operational. Ready for maintenance requests.
+[ServiceCenterAgent] Advertising free capacity: 3
+[FleetCoordinator] Vehicle registered: vehicle_agent1 — fleet size now 1
+[FleetCoordinator] Vehicle registered: vehicle_agent2 — fleet size now 2
+[FleetCoordinator] Vehicle registered: vehicle_agent3 — fleet size now 3
+
+--- Collective anomaly drives every vehicle to high urgency at once ---
+[FleetCoordinator] Anomaly from vehicle_agent1 type=brake_wear severity=high
+[FleetCoordinator] Anomaly from vehicle_agent2 type=brake_wear severity=medium
+[FleetCoordinator] COLLECTIVE ALERT — anomaly pattern detected: brake_wear across 2 vehicles.
+[FleetCoordinator] Broadcast sent: fleet_anomaly_alert(brake_wear,2).
+[VehicleAgent] Fleet brake_wear pattern across 2 units. Prioritising brake service.
+
+--- Requests arrive in a burst; pressure escalates low -> medium -> high -> critical ---
+[VehicleAgent:vehicle_agent1] Sending book_request to FleetCoordinator (part=brake_pad).
+[FleetCoordinator] book_request from vehicle_agent1 part=brake_pad urgency=high — forwarding to ServiceCenter.
+[FleetCoordinator] Broadcasting booking_pressure: medium
+[ServiceCenterAgent] Resources found. Allocating slot1 to vehicle_agent1 (tech=tech_a)
+[ServiceCenterAgent] Logged record #1 — vehicle=vehicle_agent1 part=brake_pad tech=tech_a cost=140
+[FleetCoordinator] Cross-org endorsement of record #1 for vehicle_agent1 — APPROVE.
+[ServiceCenterAgent] Record #1 ENDORSED (approve) — committed to ledger.
+[VehicleAgent] Booking CONFIRMED at service_center_agent slot slot1.
+
+[VehicleAgent:vehicle_agent2] Sending book_request to FleetCoordinator (part=brake_pad).
+[FleetCoordinator] book_request from vehicle_agent2 part=brake_pad urgency=high — forwarding to ServiceCenter.
+[FleetCoordinator] Broadcasting booking_pressure: high
+[FleetCoordinator] High pressure — advising ServiceCenterAgent.
+[ServiceCenterAgent] High fleet pressure alert: high. Prioritising urgent jobs.
+[ServiceCenterAgent] Resources found. Allocating slot2 to vehicle_agent2 (tech=tech_a)
+[ServiceCenterAgent] Logged record #2 — vehicle=vehicle_agent2 part=brake_pad tech=tech_a cost=140
+[FleetCoordinator] Cross-org endorsement of record #2 for vehicle_agent2 — APPROVE.
+[ServiceCenterAgent] Record #2 ENDORSED (approve) — committed to ledger.
+[VehicleAgent] Booking CONFIRMED at service_center_agent slot slot2.
+
+[FleetCoordinator] book_request from vehicle_agent3 part=brake_pad urgency=high — forwarding to ServiceCenter.
+[FleetCoordinator] Broadcasting booking_pressure: critical
+[FleetCoordinator] OVERLOAD DETECTED — notifying ServiceCenterAgent.
+[ServiceCenterAgent] High fleet pressure alert: critical. Prioritising urgent jobs.
+
+--- Stigmergy backpressure: a not-yet-urgent vehicle relinquishes its request ---
+[VehicleAgent] Stigmergy signal: booking pressure = critical
+[VehicleAgent] Critical backpressure — deferring request to reduce congestion.
+
+--- Confirmations decay pressure; evaporation ticks ease it back down ---
+[FleetCoordinator] Booking confirmed for vehicle_agent1 — reducing pressure.
+[FleetCoordinator] Booking confirmed for vehicle_agent2 — reducing pressure.
+[FleetCoordinator] Evaporation cycle — decaying pressure.
+[ServiceCenterAgent] slot1 is now free — capacity restored to 3
+[ServiceCenterAgent] Advertising free capacity: 3
+
+==============================================================================
+ RESULT (expected): pressure reaches CRITICAL under burst load; at least one
+ vehicle DEFERS via stigmergy backpressure; served bookings are logged and
+ endorsed; pressure decays as confirmations and evaporation ticks arrive.
+ (Exact ordering varies with the randomised telemetry timing.)
+==============================================================================

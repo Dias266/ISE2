@@ -1,0 +1,79 @@
+==============================================================================
+ SCENARIO: normal            (data/scenarios/scenario_normal.json)
+==============================================================================
+ STATUS  : EXPECTED TRACE (derived by static analysis of the .asl/.java sources)
+           NOT a captured run. Regenerate the real console output with:
+
+               gradle run  >  tests/results/scenario_normal_results.txt  2>&1
+
+           then replace everything below this header.
+ CONFIG  : env.FleetMASEnvironment USE_REAL_INTEGRATIONS = false (mock adapters)
+           ServiceCenter: capacity=3, slots=3, brake_pad=10, oil_filter=10
+ EXPECT  : low booking pressure; all booking requests are CONFIRMED; every
+           service record is logged and endorsed; slots/capacity are restored.
+------------------------------------------------------------------------------
+
+[FleetCoordinator] Booting up — stigmergy coordination active.
+[FleetCoordinator] Registered with MaintenanceDataBridge.
+[FleetCoordinator] Broadcasting booking_pressure: low
+[FleetCoordinator] Monitoring IoT stream for fleet-wide anomaly patterns.
+[ServiceCenterAgent] Operational. Ready for maintenance requests.
+[ServiceCenterAgent] Advertising free capacity: 3
+[VehicleAgent:vehicle_agent1] Initializing internal components...
+[VehicleAgent:vehicle_agent1] Registering VIN XYZ1234567890 on Hyperledger Fabric...
+[FleetCoordinator] Vehicle registered: vehicle_agent1 — fleet size now 1
+[VehicleAgent:vehicle_agent2] Initializing internal components...
+[FleetCoordinator] Vehicle registered: vehicle_agent2 — fleet size now 2
+[VehicleAgent:vehicle_agent3] Initializing internal components...
+[FleetCoordinator] Vehicle registered: vehicle_agent3 — fleet size now 3
+[VehicleAgent] Stigmergy signal: booking pressure = low
+[VehicleAgent:vehicle_agent1] Published signed telemetry (T=27.4, mileage=100, urgency=low).
+[VehicleAgent:vehicle_agent2] Published signed telemetry (T=29.1, mileage=100, urgency=low).
+[VehicleAgent:vehicle_agent3] Published signed telemetry (T=26.0, mileage=100, urgency=low).
+
+--- IoT stream produces a collective anomaly pattern ---
+[FleetCoordinator] Anomaly from vehicle_agent1 type=brake_wear severity=high
+[FleetCoordinator] Anomaly from vehicle_agent2 type=brake_wear severity=medium
+[FleetCoordinator] COLLECTIVE ALERT — anomaly pattern detected: brake_wear across 2 vehicles.
+[FleetCoordinator] Broadcast sent: fleet_anomaly_alert(brake_wear,2).
+[FleetCoordinator] Fleet anomaly logged to blockchain: brake_wear count=2
+[BLOCKCHAIN-MOCK] Fleet anomaly logged: brake_wear x2
+[VehicleAgent] Fleet brake_wear pattern across 2 units. Prioritising brake service.
+
+--- Vehicle 1 detects maintenance need and books ---
+[VehicleAgent] ML: maintenance needed (T=31.2, issues=1).
+[VehicleAgent:vehicle_agent1] Sending book_request to FleetCoordinator (part=brake_pad).
+[FleetCoordinator] book_request from vehicle_agent1 part=brake_pad urgency=high — forwarding to ServiceCenter.
+[FleetCoordinator] Broadcasting booking_pressure: medium
+[ServiceCenterAgent] Received request from vehicle_agent1 (part=brake_pad, urgency=high)
+[ServiceCenterAgent] Resources found. Allocating slot1 to vehicle_agent1 (tech=tech_a)
+[ServiceCenterAgent] Logged record #1 — vehicle=vehicle_agent1 part=brake_pad tech=tech_a cost=140
+[BLOCKCHAIN-MOCK] Service record written for: vehicle_agent1 — scheduled_maintenance
+[FleetCoordinator] Cross-org endorsement of record #1 for vehicle_agent1 — APPROVE.
+[ServiceCenterAgent] Record #1 ENDORSED (approve) — committed to ledger.
+[ServiceCenterAgent] Service completed for vehicle_agent1 by tech_a (record #1).
+[VehicleAgent] Booking CONFIRMED at service_center_agent slot slot1.
+[FleetCoordinator] Booking confirmed for vehicle_agent1 — reducing pressure.
+
+--- Vehicles 2 and 3 follow (slot2 / slot3, records #2 / #3) ---
+[ServiceCenterAgent] Resources found. Allocating slot2 to vehicle_agent2 (tech=tech_a)
+[ServiceCenterAgent] Logged record #2 — vehicle=vehicle_agent2 part=brake_pad tech=tech_a cost=140
+[FleetCoordinator] Cross-org endorsement of record #2 for vehicle_agent2 — APPROVE.
+[ServiceCenterAgent] Record #2 ENDORSED (approve) — committed to ledger.
+[VehicleAgent] Booking CONFIRMED at service_center_agent slot slot2.
+[ServiceCenterAgent] Resources found. Allocating slot3 to vehicle_agent3 (tech=tech_a)
+[ServiceCenterAgent] Logged record #3 — vehicle=vehicle_agent3 part=brake_pad tech=tech_a cost=140
+[FleetCoordinator] Cross-org endorsement of record #3 for vehicle_agent3 — APPROVE.
+[ServiceCenterAgent] Record #3 ENDORSED (approve) — committed to ledger.
+[VehicleAgent] Booking CONFIRMED at service_center_agent slot slot3.
+
+--- Slots release after service; pressure decays back to low ---
+[ServiceCenterAgent] slot1 is now free — capacity restored to 3
+[ServiceCenterAgent] Advertising free capacity: 3
+[FleetCoordinator] Evaporation cycle — decaying pressure.
+[FleetCoordinator] Pressure already at minimum (low). No decay needed.
+
+==============================================================================
+ RESULT (expected): 3/3 bookings confirmed, 3 records logged & endorsed,
+ 0 declines, capacity returns to 3, pressure stable at low.
+==============================================================================
