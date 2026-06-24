@@ -8,6 +8,25 @@
 //         edge/ML/crypto env actions (deriveECDSAKey, signTelemetryRecord, ...)
 //         are invoked only as success acknowledgements.
 //
+// CHANGE LOG (consolidation pass, Step 0 of SPE prep):
+//   - The previous revision defined +!evaluate_maintenance_need FIVE times
+//     with overlapping/contradictory contexts (Jason takes the FIRST matching
+//     plan in source order, so several of those blocks were silently dead),
+//     plus one block that called a misspelled, never-defined goal
+//     (!evaluate_maintenance instead of !evaluate_maintenance_need). This
+//     version keeps exactly ONE definition per context, ordered
+//     most-specific-first, so plan selection is unambiguous.
+//   - Kept the new service_finished handshake: this closes a real gap (the
+//     vehicle previously never learned that its service had actually
+//     completed) and is the one unambiguous improvement from the previous
+//     revision. Dropped the redundant service_cycle_finished message/handler
+//     that the previous revision also introduced for the same event.
+//   - Kept stigmergic self-deferral under critical pressure
+//     (booking_status -> deferred, auto-retried when pressure relaxes).
+//   - Isolation Forest anomaly now also escalates urgency_level(high), since
+//     a statistical outlier reading should not silently leave urgency at
+//     whatever the threshold rule produced.
+//
 // Protocol (shared across all three agents):
 //   Vehicle  -> Coordinator : book_request(Vehicle, Part, Urgency)
 //   Coordinator -> Service   : booking_request(Vehicle, Part, Urgency)
@@ -28,7 +47,7 @@ reported_issues(0).
 
 urgency_level(low).
 is_registered(false).
-booking_status(none).          // none | requested | confirmed
+booking_status(none).          // none | requested | confirmed | deferred
 booking_pressure(low).         // updated by coordinator broadcasts (stigmergy)
 service_part(oil_filter).      // part requested when booking (may switch)
 
@@ -59,7 +78,7 @@ service_part(oil_filter).      // part requested when booking (may switch)
     <- !sense_edge;
        !classify_health;
        !sign_and_publish;
-       !evaluate_maintenance_need;     // FIXED: Synchronously processed at the tail of telemetry stream processing
+       !evaluate_maintenance_need;
        !calculate_sampling_delay(Delay);
        .wait(Delay);
        !collect_telemetry.
@@ -77,15 +96,15 @@ service_part(oil_filter).      // part requested when booking (may switch)
 +!classify_health
     :  current_temperature(T) & reported_issues(I)
     <- if (T >= 40.0 | I > 0) {
-            -+urgency_level(high);
-            .print("[VehicleAgent] ML: maintenance needed (T=", T, ", issues=", I, ").")
+           -+urgency_level(high);
+           .print("[VehicleAgent] ML: maintenance needed (T=", T, ", issues=", I, ").")
        } else {
-            -+urgency_level(low)
+           -+urgency_level(low)
        };
        if (T >= 45.0) {
-            -+telemetry_anomaly(true);
-            -+urgency_level(high);     // FIXED: Enforce critical urgency tracking when Isolation Forest detects an outlier
-            .print("[VehicleAgent] Isolation Forest: statistical outlier telemetry (T=", T, ").")
+           -+telemetry_anomaly(true);
+           -+urgency_level(high);     // a statistical outlier always escalates urgency
+           .print("[VehicleAgent] Isolation Forest: statistical outlier telemetry (T=", T, ").")
        }.
 
 // F3: ECDSA signing + MQTT publish (env actions acknowledge success only)
@@ -104,111 +123,45 @@ service_part(oil_filter).      // part requested when booking (may switch)
 +!calculate_sampling_delay(5000).      // safe fallback
 
 /* ---------------- Stigmergy-aware booking ---------------- */
-// Guarded plan: if we have high urgency and a part is defined, book it immediately
+// Plans are ordered most-specific-context-first; Jason takes the first match.
 
-
-
-
-// =============================================================================
-// vehicle_agent.asl — Fix Deferred Booking Logic Suffixes
-// =============================================================================
-
-// 1. Rename the goal head to match the main telemetry evaluation cycle signature
-+!evaluate_maintenance_need : booking_status(deferred) <-
-    .print("[VehicleAgent] Maintenance evaluation paused. Request is deferred due to critical fleet load-shedding.");
-    
-    .wait(3000); 
-    
-    ?booking_pressure(CurrentPressure);
-    if (CurrentPressure == low | CurrentPressure == medium) {
-        .print("[VehicleAgent] Fleet backpressure relaxed. Re-enabling maintenance evaluation pathways.");
-        -+booking_status(none);
-    };
-    !evaluate_maintenance_need. // Fixed suffix
-
-// 2. Fix the suffix inside the reactive booking deferral handler
-+booking_deferred(AlternativeSlot, Center) <- 
-    .print("[VehicleAgent] Booking DEFERRED by ", Center, ". Capacity full. Retrying shortly...");
-    -+booking_status(none); 
-    
-    .random(R);
-    BackoffTime = 2000 + (R * 1500); 
-    .wait(BackoffTime);
-    !evaluate_maintenance_need. // Fixed suffix
-
-
-
-
-// 1. Target Condition: High urgency and fully clear state -> Proceed with booking
+// 1. Already mid-flight (requested or confirmed) — do nothing, await callback.
 +!evaluate_maintenance_need
-    : urgency_level(high) & booking_status(none) & service_part(P)
+    :  booking_status(requested) | booking_status(confirmed)
+    <- true.
+
+// 2. Deferred under prior critical backpressure — recheck whether pressure
+//    has relaxed enough to retry; otherwise stay deferred this cycle.
++!evaluate_maintenance_need
+    :  booking_status(deferred)
+    <- ?booking_pressure(Level);
+       if (Level == low | Level == medium) {
+           .print("[VehicleAgent] Fleet backpressure relaxed. Resuming evaluation.");
+           -+booking_status(none);
+           !evaluate_maintenance_need
+       } else {
+           .print("[VehicleAgent] Still deferred — fleet pressure remains ", Level, ".")
+       }.
+
+// 3. Healthy and idle — nothing to do this cycle.
++!evaluate_maintenance_need
+    :  urgency_level(low) & booking_status(none)
+    <- true.
+
+// 4. Urgent and idle — request a booking.
++!evaluate_maintenance_need
+    :  urgency_level(high) & booking_status(none)
     <- !request_fleet_booking.
 
-// 2. Safe Guard Condition: If already requested or confirmed, DO NOT retry or recurse.
-// Yield gracefully and wait for asynchronous callback updates from the service center.
+// 5. Catch-all fallback (should not normally be reached).
 +!evaluate_maintenance_need
-    : urgency_level(high) & (booking_status(requested) | booking_status(confirmed))
-    <- .print("[VehicleAgent] Maintenance pipeline active (", booking_status, "). Awaiting network handshake response...").
-
-// 3. Recovery Plan: High urgency and explicitly stuck in a 'deferred' state
-+!evaluate_maintenance_need
-    : urgency_level(high) & booking_status(deferred)
-    <- .print("[VehicleAgent] Retrying deferred request due to ongoing high urgency conditions.");
-       -+booking_status(none); 
-       !evaluate_maintenance_need. 
-
-// 4. Fallback Plan: Urgency is high, clear state, but part was dropped due to race conditions
-+!evaluate_maintenance_need
-    : urgency_level(high) & booking_status(none)
-    <- .print("[VehicleAgent] Urgency is high, but no target component found. Defaulting to oil_filter.");
-       +service_part(oil_filter);
-       !request_fleet_booking.
-
-// Unify the deferred handler under the correct '!evaluate_maintenance_need' signature
-+!evaluate_maintenance_need : booking_status(deferred) <-
-    .print("[VehicleAgent] Maintenance evaluation paused. Request is deferred due to active fleet load-shedding.");
-    .wait(4000); 
-    
-    ?booking_pressure(CurrentPressure);
-    if (CurrentPressure == low | CurrentPressure == medium) {
-        .print("[VehicleAgent] Fleet backpressure relaxed. Re-enabling evaluation pathways.");
-        -+booking_status(none)
-    } else {
-        !evaluate_maintenance_need
-    }.
-
-// 5. Unconditional catch-all fallback to handle unmapped telemetry evaluation states (low urgency)
-+!evaluate_maintenance_need : true <-
-    ?urgency_level(Urgency);
-    ?reported_issues(Issues);
-    .wait(1000). // Smoothly yield to prevent execution lock spikes
-
-
-
-    
-// =============================================================================
-// vehicle_agent.asl — Handling Stigmergy Deferral States
-// =============================================================================
-
-// Plan: Handle localized maintenance evaluation when load-shed by high backpressure
-+!evaluate_maintenance : booking_status(deferred) <-
-    .print("[VehicleAgent] Maintenance evaluation paused. Request is deferred due to critical fleet load-shedding.");
-    
-    // Cool down for a cycle to allow the Service Center to clear slots
-    .wait(3000); 
-    
-    // Check if system pressure dropped, enabling a re-evaluation attempt
-    ?booking_pressure(CurrentPressure);
-    if (CurrentPressure == low | CurrentPressure == medium) {
-        .print("[VehicleAgent] Fleet backpressure relaxed. Re-enabling maintenance evaluation pathways.");
-        -+booking_status(none);
-    }
-    !evaluate_maintenance.
+    <- true.
 
 // Defer autonomously under critical backpressure (load shedding)
 +!request_fleet_booking
     :  booking_pressure(critical) & not urgency_level(critical)
-    <- .print("[VehicleAgent] Critical backpressure — deferring request to reduce congestion.").
+    <- .print("[VehicleAgent] Critical backpressure — deferring request to reduce congestion.");
+       -+booking_status(deferred).
 
 // Otherwise send a booking request to the FleetCoordinator
 +!request_fleet_booking
@@ -219,14 +172,16 @@ service_part(oil_filter).      // part requested when booking (may switch)
        .send(fleet_coordinator_agent, tell, book_request(Me, P, high)).
 
 /* ---------------- Reactive coordination plans ---------------- */
-// Stigmergy signal: fleet booking pressure changed
-// Reactive Plan: React to environmental booking pressure shifts (Stigmergy)
-+booking_pressure(Level) <- 
-    .print("[VehicleAgent] Stigmergy Signal: Fleet booking pressure changed to: ", Level); 
-    if (Level == critical & booking_status(requested) & not urgency_level(critical)) { 
-        .print("[VehicleAgent] Shedding load. Relinquishing active request slot."); 
-        -+booking_status(deferred); 
-    }.
+
+// Stigmergy signal: fleet booking pressure changed. If we are mid-request and
+// the fleet just escalated to critical, shed our own load proactively instead
+// of waiting for the service center to defer us.
++booking_pressure(Level)
+    <- .print("[VehicleAgent] Stigmergy signal: booking pressure = ", Level);
+       if (Level == critical & booking_status(requested) & not urgency_level(critical)) {
+           .print("[VehicleAgent] Shedding load — relinquishing active request.");
+           -+booking_status(deferred)
+       }.
 
 // Fleet-wide brake_wear pattern -> prioritise brake service
 +fleet_anomaly_alert(brake_wear, Count)
@@ -236,54 +191,43 @@ service_part(oil_filter).      // part requested when booking (may switch)
        ?reported_issues(I);
        -+reported_issues(I + 1).
 
-// Reactive Plan: Fleet-wide pattern notifications from coordinator
-+fleet_anomaly_alert(AnomalyType, Count) <- 
-    .print("[VehicleAgent] Fleet alert received: ", AnomalyType, " tracking across ", Count, " units.");
-    
-    // Increment the issue tracking count
-    if (reported_issues(I)) { 
-        -+reported_issues(I + 1); 
-    };
-    
-    // FIX: Dynamically deduce and bind the correct service part based on the fleet anomaly type
-    if (AnomalyType == oil_pressure) {
-        -+service_part(oil_filter);
-        .print("[VehicleAgent] Fleet oil_pressure pattern detected. Prioritising oil service.");
-    };
-    if (AnomalyType == brake_wear) {
-        -+service_part(brake_pad);
-        .print("[VehicleAgent] Fleet brake_wear pattern detected. Prioritising brake service.");
-    }.
+// Fleet-wide oil_pressure pattern -> prioritise oil service
++fleet_anomaly_alert(oil_pressure, Count)
+    <- .print("[VehicleAgent] Fleet oil_pressure pattern across ", Count,
+              " units. Prioritising oil service.");
+       -+service_part(oil_filter);
+       ?reported_issues(I);
+       -+reported_issues(I + 1).
 
-// Reactive Plan: Reset booking state once the Coordinator confirms service completion
-+service_finished[source(fleet_coordinator_agent)]
-    <- .print("[VehicleAgent] Service cycle finished. Resetting booking status to none.");
-       -+booking_status(none);
-       -+urgency_level(low);          
-       -+reported_issues(0);          // Flush the issue tracking counter
-       -+service_part(oil_filter);    // Reset back to default part
-       -service_finished[source(fleet_coordinator_agent)].
+// Any other fleet-wide anomaly pattern
++fleet_anomaly_alert(AnomalyType, Count)
+    <- .print("[VehicleAgent] Fleet alert: ", AnomalyType, " across ", Count, " units.");
+       ?reported_issues(I);
+       -+reported_issues(I + 1).
 
-// Add this inside vehicle_agent.asl to clear its state lock
-+service_cycle_finished <-
-    .print("[VehicleAgent] Service cycle finished received. Resetting status to none.");
-    -+booking_status(none);
-    !collect_telemetry. // Resume standard monitoring loop
-       
 // Booking outcomes from the ServiceCenter
 +booking_confirmed(Slot, Center)
     <- .print("[VehicleAgent] Booking CONFIRMED at ", Center, " slot ", Slot, ".");
        -+booking_status(confirmed).
 
-// =============================================================================
-// vehicle_agent.asl — Fix Deferred Booking Logic
-// =============================================================================
++booking_deferred(AltSlot, Center)
+    <- .print("[VehicleAgent] Booking deferred by ", Center,
+              " — alternative slot ", AltSlot, " accepted.");
+       -+booking_status(confirmed).
 
 +booking_declined(Reason)
     <- .print("[VehicleAgent] Booking declined: ", Reason, ". Will retry on next cycle.");
        -+booking_status(none).
 
+// Service Center confirms the physical service work is complete: reset state
+// so the vehicle can be evaluated and re-booked on a future cycle.
++service_finished
+    <- .print("[VehicleAgent] Service cycle finished. Resetting booking status.");
+       -+booking_status(none);
+       -+urgency_level(low);
+       -+reported_issues(0);
+       -+service_part(oil_filter).
+
 /* ---------------- Failure fallback ---------------- */
 -!X
     <- .print("[VehicleAgent] Plan failure on: ", X).
-
