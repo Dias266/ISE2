@@ -67,9 +67,7 @@ overload_threshold(3).
               " part=", Part, " urgency=", Urgency, " — forwarding to ServiceCenter.");
        !escalate_pressure(Level);
        .send(service_center_agent, tell, booking_request(VehicleID, Part, Urgency));
-       !check_overload;
-       // .abolish will completely remove the belief matching this pattern
-       .abolish(book_request(VehicleID, Part, Urgency)).
+       !check_overload.
 
 
 +request_received(VehicleID, Urgency)
