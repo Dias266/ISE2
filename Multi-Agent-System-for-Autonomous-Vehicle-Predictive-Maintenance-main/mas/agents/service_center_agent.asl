@@ -10,6 +10,21 @@
 //   3. Service execution      — log immutable service record, publish completion
 //   4. Consensus participation— multi-org endorsement of service records
 //
+// CHANGE LOG (consolidation pass, Step 0 of SPE prep):
+//   - Restored [atomic] on the full reservation (slot + capacity + parts +
+//     record id together) — without it, two concurrent bookings can both
+//     read capacity > 0 before either decrements it, double-allocating a
+//     technician. This is the aggregate-consistency boundary referenced in
+//     the SPE/DDD writeup (ServiceCenter as Aggregate Root).
+//   - Restored the missing "no qualified technician" decline branch.
+//   - Reverted RID back to the monotonic record_counter (was briefly
+//     replaced with seconds-of-clock, which is NOT monotonic across a
+//     minute boundary and can collide within the same second).
+//   - Kept the new split into evaluate_request -> perform_booking ->
+//     background_service_cycle -> complete_service: this is a genuine
+//     improvement, separating the instant accept/defer/decline decision
+//     from the timed service simulation.
+//
 // Shared protocol:
 //   Coordinator -> Service : booking_request(Vehicle, Part, Urgency)
 //   Service  -> Vehicle    : booking_confirmed(Slot, Center)
@@ -84,81 +99,17 @@ record_valid(RID) :- service_record(RID, _, _, _, _).
 // ---------------------------------------------------------------------------
 
 // Booking request forwarded by the FleetCoordinator. Carries the required Part.
-// =============================================================================
-// service_center_agent.asl — Strict Param Validation Fix
-// =============================================================================
-
-// Handle booking request - pass variables cleanly down
-+booking_request(VehicleID, TargetPart, Urgency) <- 
-    .print("[ServiceCenterAgent] Processing incoming request from ", VehicleID, " for part: ", TargetPart);
-    !evaluate_request(VehicleID, TargetPart, Urgency).
-
-// Atomic Resource Check matching specific TargetPart requested
-+!evaluate_request(VehicleID, TargetPart, Urgency) 
-    : available_slot(SlotID, available) & 
-      parts_inventory(TargetPart, Qty) & Qty > 0 & 
-      current_capacity(C) & C > 0 & 
-      qualified(Tech, TargetPart) <- 
-    
-    // Explicitly lock slot status immediately to protect from race conditions
-    -+available_slot(SlotID, occupied);
-    .print("[ServiceCenterAgent] Slot secured. Allocating ", SlotID, " to ", VehicleID, " for ", TargetPart);
-    !perform_booking(VehicleID, SlotID, TargetPart, Tech).
-
-// Fallback for no parts available for that specific target component
-+!evaluate_request(VehicleID, TargetPart, Urgency) : parts_inventory(TargetPart, 0) <- 
-    .send(VehicleID, tell, booking_declined(parts_shortage(TargetPart))).
-
-// General capacity fallback
-+!evaluate_request(VehicleID, TargetPart, Urgency) <- 
-    .send(VehicleID, tell, booking_deferred(next_available, service_center_agent)).
-
-
-// =============================================================================
-// service_center_agent.asl — Fixed Async Trigger Syntax
-// =============================================================================
-
-+!perform_booking(VehicleID, SlotID, TargetPart, Tech) <- 
-    ?current_capacity(C); -+current_capacity(C - 1);
-    ?parts_inventory(TargetPart, Qty); -+parts_inventory(TargetPart, Qty - 1);
-    
-    .time(H, M, S);
-    RecordID = S; 
-    
-    // Write clean data to Blockchain mock interface
-    writeServiceRecord(VehicleID, TargetPart, Tech, "scheduled");
-    
-    // Notify corresponding coordination channels
-    .send(VehicleID, tell, booking_confirmed(SlotID, service_center_agent));
-    .send(fleet_coordinator_agent, tell, booking_confirmed(VehicleID));
-    
-    .print("[ServiceCenterAgent] Booking successfully verified for ", VehicleID, " with item: ", TargetPart);
-    
-    // FIX: Removed the leading dot. Triggering a standard AgentSpeak sub-goal.
-    !!background_service_cycle(VehicleID, TargetPart, Tech, RecordID, SlotID).
-
-// FIX: Updated matching operator pattern to standard achievement goal format (+!)
-+!background_service_cycle(VehicleID, TargetPart, Tech, RecordID, SlotID) <-
-    .wait(2500); // Safely pauses this sub-goal's execution thread without blocking the agent's main belief queue
-    .print("[ServiceCenterAgent] Technician ", Tech, " finished repairing ", VehicleID, " (", TargetPart, ")");
-    !complete_service(VehicleID, TargetPart, Tech, RecordID, SlotID).
-
-+!complete_service(VehicleID, Part, Tech, RID, SlotID) <- 
-    .send(fleet_coordinator_agent, tell, service_completed(VehicleID, RID));
-    .send(VehicleID, tell, service_cycle_finished);
-    !release_slot(SlotID).
-
-+!release_slot(SlotID) <-
-    -+available_slot(SlotID, available);
-    ?current_capacity(C); -+current_capacity(C + 1);
-    .print("[ServiceCenterAgent] Slot ", SlotID, " is now free. Capacity restored.").
++booking_request(VehicleID, Part, Urgency)
+    <- .print("[ServiceCenterAgent] Received request from ", VehicleID,
+              " (part=", Part, ", urgency=", Urgency, ")");
+       !evaluate_request(VehicleID, Part, Urgency).
 
 // 1. Success: free slot AND part in stock AND capacity AND a qualified technician.
-//    Marked [atomic] so the whole reservation (slot, capacity, part, record id)
-//    runs without interleaving. This removes the concurrency race in which a
-//    concurrent booking could transiently empty a belief while many vehicles
-//    book at once. NOTE: there is no .wait inside this plan; the timed service
-//    and the slot release are handled by the non-atomic pending_release plan.
+//    Marked [atomic] so the WHOLE reservation (slot, capacity, part, record id)
+//    runs without interleaving. This is the line that removes the concurrency
+//    race in which a concurrent booking could transiently empty a belief while
+//    many vehicles book at once. NOTE: there is no .wait inside this plan; the
+//    timed service and slot release are handled by non-atomic sub-goals below.
 @sc_accept[atomic]
 +!evaluate_request(VehicleID, Part, Urgency)
     :  available_slot(SlotID, available)
@@ -176,7 +127,13 @@ record_valid(RID) :- service_record(RID, _, _, _, _).
        ?record_counter(RC); RID = RC + 1;
        -record_counter(RC); +record_counter(RID);
        +service_record(RID, VehicleID, Part, Tech, Cost);
-       // Log to the blockchain (Codice 87474) and request cross-org endorsement
+       !perform_booking(VehicleID, SlotID, Part, Tech, RID, Cost).
+
+// Notify ledger + peers + parties, then hand off the timed service simulation
+// to a separate, non-atomic intention (kept distinct so a long .wait never
+// blocks the atomic reservation block above from running for other vehicles).
++!perform_booking(VehicleID, SlotID, Part, Tech, RID, Cost)
+    <- // Log to the blockchain (Codice 87474) and request cross-org endorsement
        writeServiceRecord(VehicleID, scheduled_maintenance);
        .send(fleet_coordinator_agent, tell, endorse_request(RID, VehicleID));
        // Confirm to the vehicle and notify the coordinator (decays pressure)
@@ -184,8 +141,7 @@ record_valid(RID) :- service_record(RID, _, _, _, _).
        .send(fleet_coordinator_agent, tell, booking_confirmed(VehicleID));
        .print("[ServiceCenterAgent] Logged record #", RID, " — vehicle=", VehicleID,
               " part=", Part, " tech=", Tech, " cost=", Cost);
-       // Hand off the timed service + release to a non-atomic intention
-       +pending_release(SlotID, VehicleID, Tech, RID).
+       !background_service_cycle(VehicleID, SlotID, Tech, RID).
 
 // 2. Parts shortage: requested part out of stock -> decline with reason
 +!evaluate_request(VehicleID, Part, Urgency)
@@ -220,17 +176,28 @@ record_valid(RID) :- service_record(RID, _, _, _, _).
 // PLANS: SERVICE COMPLETION & TIMED RELEASE (non-atomic — may .wait)
 // ---------------------------------------------------------------------------
 
-// Triggered by the reservation above. Runs the (simulated 2 s) service, then
-// frees the slot. This runs as its own non-atomic intention, so the .wait does
-// not block other bookings.
-+pending_release(SlotID, VehicleID, Tech, RID)
+// Runs the simulated service time, then hands off to completion + slot release.
+// This runs as its own non-atomic intention, so the .wait does not block other
+// bookings from being accepted by the atomic plan above.
++!background_service_cycle(VehicleID, SlotID, Tech, RID)
+    <- .wait(2000);
+       .print("[ServiceCenterAgent] Technician ", Tech, " finished servicing ",
+              VehicleID, " (record #", RID, ").");
+       !complete_service(VehicleID, SlotID, Tech, RID).
+
++!complete_service(VehicleID, SlotID, Tech, RID)
     <- .send(fleet_coordinator_agent, tell, service_completed(VehicleID, RID));
-       .print("[ServiceCenterAgent] Service completed for ", VehicleID,
-              " by ", Tech, " (record #", RID, ").");
-       .wait(2000);
-       -pending_release(SlotID, VehicleID, Tech, RID);
+       .send(VehicleID, tell, service_finished);
        !release_slot(SlotID).
 
+// Restore the slot and one unit of capacity atomically (no interleaving, no wait).
+@sc_release[atomic]
++!release_slot(SlotID)
+    :  current_capacity(C)
+    <- -available_slot(SlotID, occupied); +available_slot(SlotID, available);
+       -current_capacity(C); +current_capacity(C + 1);
+       .print("[ServiceCenterAgent] ", SlotID, " is now free — capacity restored to ", C + 1);
+       !advertise_capacity.
 
 // ---------------------------------------------------------------------------
 // PLANS: CONSENSUS PARTICIPATION (endorsement)
